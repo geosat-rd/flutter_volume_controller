@@ -2,8 +2,66 @@
 
 #include <windows.h>
 #include <mmdeviceapi.h>
+#include <string>
+#include <algorithm>
+#include <mutex>
 
 namespace flutter_volume_controller {
+	static std::wstring g_current_device_id = L"";
+	static std::recursive_mutex g_volume_mutex;
+
+	class AudioNotificationClient;
+	static AudioNotificationClient* g_notification_client = NULL;
+	static IMMDeviceEnumerator* g_device_enumerator = NULL;
+
+	class AudioNotificationClient : public IMMNotificationClient {
+	private:
+		LONG _cRef;
+	public:
+		AudioNotificationClient() : _cRef(1) {}
+		virtual ~AudioNotificationClient() {}
+
+		// IUnknown methods
+		STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+			if (riid == IID_IUnknown || riid == __uuidof(IMMNotificationClient)) {
+				*ppv = static_cast<IMMNotificationClient*>(this);
+				AddRef();
+				return S_OK;
+			}
+			*ppv = NULL;
+			return E_NOINTERFACE;
+		}
+		STDMETHODIMP_(ULONG) AddRef() {
+			return InterlockedIncrement(&_cRef);
+		}
+		STDMETHODIMP_(ULONG) Release() {
+			ULONG ulRef = InterlockedDecrement(&_cRef);
+			if (ulRef == 0) {
+				delete this;
+			}
+			return ulRef;
+		}
+
+		// IMMNotificationClient methods
+		STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDeviceId) {
+			if (flow == eRender && role == eConsole) {
+				// Re-register the default controller and update volume listener if default playback device changes
+				VolumeController::GetInstance().RegisterController();
+
+				auto current_volume = VolumeController::GetInstance().GetCurrentVolume();
+				if (current_volume.has_value()) {
+					VolumeController::GetInstance().NotifyVolumeChanged(current_volume.value());
+				}
+			}
+			return S_OK;
+		}
+
+		STDMETHODIMP OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwState) { return S_OK; }
+		STDMETHODIMP OnDeviceAdded(LPCWSTR pwstrDeviceId) { return S_OK; }
+		STDMETHODIMP OnDeviceRemoved(LPCWSTR pwstrDeviceId) { return S_OK; }
+		STDMETHODIMP OnPropertyValueChanged(LPCWSTR pwstrDeviceId, const PROPERTYKEY key) { return S_OK; }
+	};
+
 	VolumeController::VolumeController() : endpoint_volume(NULL), volume_notification(NULL) {}
 
 	VolumeController& VolumeController::GetInstance() {
@@ -12,43 +70,72 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::RegisterController() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
 		IMMDevice* default_device = NULL;
-		IMMDeviceEnumerator* device_enumator = NULL;
 
-		CoInitialize(NULL);
+		if (g_device_enumerator == NULL) {
+			CoInitialize(NULL);
+			hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator),
+				(LPVOID*)&g_device_enumerator);
+			if (FAILED(hr)) {
+				return false;
+			}
+			g_notification_client = new AudioNotificationClient();
+			g_device_enumerator->RegisterEndpointNotificationCallback(g_notification_client);
+		}
 
-		hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator),
-			(LPVOID*)&device_enumator);
+		hr = g_device_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &default_device);
 		if (FAILED(hr)) {
 			return false;
 		}
 
-		hr = device_enumator->GetDefaultAudioEndpoint(eRender, eConsole, &default_device);
-		if (FAILED(hr)) {
-			return false;
+		LPWSTR device_id = NULL;
+		hr = default_device->GetId(&device_id);
+		std::wstring new_device_id = L"";
+		if (SUCCEEDED(hr) && device_id != NULL) {
+			new_device_id = device_id;
+			CoTaskMemFree(device_id);
 		}
 
-		hr = default_device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, NULL,
-			(LPVOID*)&endpoint_volume);
-		if (FAILED(hr)) {
-			return false;
+		if (new_device_id != g_current_device_id || endpoint_volume == NULL) {
+			if (endpoint_volume != NULL) {
+				if (volume_notification != NULL) {
+					endpoint_volume->UnregisterControlChangeNotify(volume_notification);
+				}
+				endpoint_volume->Release();
+				endpoint_volume = NULL;
+			}
+
+			hr = default_device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, NULL,
+				(LPVOID*)&endpoint_volume);
+
+			if (SUCCEEDED(hr) && endpoint_volume != NULL) {
+				g_current_device_id = new_device_id;
+				if (volume_notification != NULL) {
+					endpoint_volume->RegisterControlChangeNotify(volume_notification);
+				}
+			}
 		}
 
-		return true;
+		default_device->Release();
+
+		return endpoint_volume != NULL;
 	}
 
 	bool VolumeController::RegisterNotification(VolumeCallback callback) {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
 
 		if (!callback) {
 			return false;
 		}
 
+		RegisterController();
+
 		if (!endpoint_volume) {
 			return false;
 		}
-
 
 		volume_notification = new VolumeNotification(callback);
 		hr = endpoint_volume->RegisterControlChangeNotify(volume_notification);
@@ -60,25 +147,51 @@ namespace flutter_volume_controller {
 	}
 
 	void VolumeController::DisposeController() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		if (endpoint_volume) {
 			DisposeNotification();
 			endpoint_volume->Release();
+			endpoint_volume = NULL;
+		}
+
+		if (g_device_enumerator != NULL) {
+			if (g_notification_client != NULL) {
+				g_device_enumerator->UnregisterEndpointNotificationCallback(g_notification_client);
+				g_notification_client->Release();
+				g_notification_client = NULL;
+			}
+			g_device_enumerator->Release();
+			g_device_enumerator = NULL;
 		}
 
 		CoUninitialize();
 	}
 
 	void VolumeController::DisposeNotification() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		if (volume_notification) {
 			if (endpoint_volume) {
 				endpoint_volume->UnregisterControlChangeNotify(volume_notification);
 			}
 			volume_notification->Release();
+			volume_notification = NULL;
+		}
+	}
+
+	void VolumeController::NotifyVolumeChanged(float volume) {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
+		if (volume_notification != NULL) {
+			AUDIO_VOLUME_NOTIFICATION_DATA data = { 0 };
+			data.fMasterVolume = volume;
+			volume_notification->OnNotify(&data);
 		}
 	}
 
 	bool VolumeController::SetVolume(float volume) {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -99,8 +212,11 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetMaxVolume() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
 		UINT current_step, step_count;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -125,8 +241,11 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetMinVolume() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
 		UINT current_step, step_count;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -151,7 +270,10 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetVolumeUp(float step) {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -174,7 +296,10 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetVolumeDown(float step) {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -197,7 +322,10 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetVolumeUpBySystemStep() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -212,7 +340,10 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetVolumeDownBySystemStep() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -227,7 +358,10 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::SetMute(bool is_mute) {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
+
+		RegisterController();
 
 		if (!endpoint_volume) {
 			return false;
@@ -248,6 +382,7 @@ namespace flutter_volume_controller {
 	}
 
 	bool VolumeController::ToggleMute() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		std::optional<bool> is_muted = GetMute();
 
 		if (!is_muted.has_value()) {
@@ -258,11 +393,14 @@ namespace flutter_volume_controller {
 	}
 
 	std::optional<float> VolumeController::GetCurrentVolume() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
 		float current_volume = 0.0f;
 
+		RegisterController();
+
 		if (!endpoint_volume) {
-			return false;
+			return std::nullopt;
 		}
 
 		hr = endpoint_volume->GetMasterVolumeLevelScalar(&current_volume);
@@ -274,11 +412,14 @@ namespace flutter_volume_controller {
 	}
 
 	std::optional<bool> VolumeController::GetMute() {
+		std::lock_guard<std::recursive_mutex> lock(g_volume_mutex);
 		HRESULT hr = E_FAIL;
 		BOOL is_muted;
 
+		RegisterController();
+
 		if (!endpoint_volume) {
-			return false;
+			return std::nullopt;
 		}
 
 		hr = endpoint_volume->GetMute(&is_muted);
