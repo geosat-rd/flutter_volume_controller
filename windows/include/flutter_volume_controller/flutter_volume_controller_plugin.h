@@ -55,7 +55,9 @@ namespace flutter_volume_controller {
 
 	class VolumeNotificationStreamHandler : public flutter::StreamHandler<flutter::EncodableValue> {
 	public:
-		VolumeNotificationStreamHandler(VolumeController& volume_controller);
+		VolumeNotificationStreamHandler(
+			VolumeController& volume_controller,
+			flutter::PluginRegistrarWindows* registrar);
 
 		virtual ~VolumeNotificationStreamHandler();
 
@@ -71,6 +73,7 @@ namespace flutter_volume_controller {
 
 	private:
 		VolumeController& volume_controller;
+		flutter::PluginRegistrarWindows* registrar;
 
 		std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> sink;
 	};

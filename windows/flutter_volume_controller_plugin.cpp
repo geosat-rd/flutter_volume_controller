@@ -1,6 +1,11 @@
 #include "include/flutter_volume_controller/flutter_volume_controller_plugin.h"
 #include "include/flutter_volume_controller/constants.h"
 
+#include <windows.h>
+
+#define WM_VOLUME_CHANGED (WM_APP + 999)
+#define WM_DEFAULT_DEVICE_CHANGED (WM_APP + 998)
+
 namespace flutter_volume_controller {
 
 	const flutter::EncodableValue* GetArgValue(const flutter::EncodableMap& map, const char* key) {
@@ -29,7 +34,36 @@ namespace flutter_volume_controller {
 			});
 
 		event_channel->SetStreamHandler(
-			std::make_unique<VolumeNotificationStreamHandler>(VolumeController::GetInstance()));
+			std::make_unique<VolumeNotificationStreamHandler>(VolumeController::GetInstance(), registrar));
+
+		// GetNativeWindow() returns the Flutter child view HWND.
+		// RegisterTopLevelWindowProcDelegate hooks the top-level parent window.
+		// We must post WM_VOLUME_CHANGED to the top-level window so it is
+		// received by the registered WndProc delegate.
+		HWND viewHwnd = registrar->GetView() ? registrar->GetView()->GetNativeWindow() : NULL;
+		HWND hwnd = viewHwnd ? GetAncestor(viewHwnd, GA_ROOT) : NULL;
+		fprintf(stderr, "[VolumePlugin] RegisterWithRegistrar: viewHwnd=%p rootHwnd=%p\n", viewHwnd, hwnd);
+		fflush(stderr);
+		VolumeController::GetInstance().SetHwnd(hwnd);
+
+		auto window_proc_delegate = [](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) -> std::optional<LRESULT> {
+			if (message == WM_VOLUME_CHANGED) {
+				float volume = 0.0f;
+				std::memcpy(&volume, &wparam, sizeof(float));
+				VolumeController::GetInstance().NotifyVolumeChanged(volume);
+				return 0;
+			}
+			else if (message == WM_DEFAULT_DEVICE_CHANGED) {
+				VolumeController::GetInstance().RegisterController();
+				auto current_volume = VolumeController::GetInstance().GetCurrentVolume();
+				if (current_volume.has_value()) {
+					VolumeController::GetInstance().NotifyVolumeChanged(current_volume.value());
+				}
+				return 0;
+			}
+			return std::nullopt;
+		};
+		registrar->RegisterTopLevelWindowProcDelegate(window_proc_delegate);
 
 		registrar->AddPlugin(std::move(plugin));
 	}
@@ -181,7 +215,9 @@ namespace flutter_volume_controller {
 	}
 
 	VolumeNotificationStreamHandler::VolumeNotificationStreamHandler(
-		VolumeController& volume_controller) : volume_controller(volume_controller), sink(nullptr) {}
+		VolumeController& volume_controller,
+		flutter::PluginRegistrarWindows* registrar)
+		: volume_controller(volume_controller), registrar(registrar), sink(nullptr) {}
 
 	VolumeNotificationStreamHandler::~VolumeNotificationStreamHandler() {}
 
@@ -189,6 +225,16 @@ namespace flutter_volume_controller {
 		const flutter::EncodableValue* arguments,
 		std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&& events) {
 		sink = std::move(events);
+
+		if (registrar) {
+			HWND viewHwnd = registrar->GetView() ? registrar->GetView()->GetNativeWindow() : NULL;
+			HWND hwnd = viewHwnd ? GetAncestor(viewHwnd, GA_ROOT) : NULL;
+			fprintf(stderr, "[VolumePlugin] OnListenInternal: viewHwnd=%p rootHwnd=%p\n", viewHwnd, hwnd);
+			fflush(stderr);
+			if (hwnd != NULL) {
+				volume_controller.SetHwnd(hwnd);
+			}
+		}
 		
 		auto callback = std::bind(&VolumeNotificationStreamHandler::OnVolumeChanged, this, std::placeholders::_1);
 

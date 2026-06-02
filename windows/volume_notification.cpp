@@ -1,4 +1,6 @@
 #include "include/flutter_volume_controller/volume_notification.h"
+#include "include/flutter_volume_controller/volume_controller.h"
+#include <cstdio>
 
 namespace flutter_volume_controller {
 	VolumeNotification::VolumeNotification(VolumeCallback pCallback) : lRef(1), pCallback(pCallback) {}
@@ -31,7 +33,9 @@ namespace flutter_volume_controller {
 			return E_INVALIDARG;
 		}
 
-		pCallback(pNotify->fMasterVolume);
+		// fprintf(stderr, "[VolumeNotification] OnNotify fired: volume=%.4f\n", pNotify->fMasterVolume);
+		// fflush(stderr);
+		VolumeController::GetInstance().PostVolumeMessage(pNotify->fMasterVolume);
 		return S_OK;
 	}
 }

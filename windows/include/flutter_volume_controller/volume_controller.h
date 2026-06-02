@@ -5,6 +5,7 @@
 
 #include <endpointvolume.h>
 #include <optional>
+#include <windows.h>
 
 namespace flutter_volume_controller {
 	class VolumeController {
@@ -13,13 +14,19 @@ namespace flutter_volume_controller {
 
 		bool RegisterController();
 
-		bool RegisterNotification(VolumeCallback callback);
+		bool RegisterNotification(VolumeCallback cb);
 
 		void DisposeController();
 
 		void DisposeNotification();
 
 		void NotifyVolumeChanged(float volume);
+
+		void PostVolumeMessage(float volume);
+
+		void SetHwnd(HWND h) { this->hwnd = h; }
+		HWND GetHwnd() const { return hwnd; }
+		VolumeCallback GetCallback() const { return callback; }
 
 		bool SetVolume(float volume);
 
@@ -53,6 +60,9 @@ namespace flutter_volume_controller {
 		IAudioEndpointVolume* endpoint_volume;
 
 		VolumeNotification* volume_notification;
+
+		HWND hwnd;
+		VolumeCallback callback;
 	};
 }
 
