@@ -19,6 +19,8 @@ namespace flutter_volume_controller {
 
 		void DisposeNotification();
 
+		void NotifyVolumeChanged(float volume);
+
 		bool SetVolume(float volume);
 
 		bool SetMaxVolume();
